@@ -19,6 +19,7 @@
 #define DEFAULT_PORT 8081
 #define DEFAULT_SERVER_PORT 9001
 #define MAX_THREADS 100
+#define HEADER_SIZE 32  // Size of the header in bytes
 
 // Global variables
 int server_fd;
@@ -337,7 +338,7 @@ void handle_connection(int client_socket) {
         return;
     }
     
-    // Read client input first for validation
+    // Read client input with header
     char buffer[1024] = {0};
     ssize_t bytes_read = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
     
@@ -346,20 +347,39 @@ void handle_connection(int client_socket) {
         return;
     }
     
-    // Ensure null termination
-    buffer[bytes_read] = '\0';
-    
-    // Validate input - check if it's a non-negative integer
-    if (!is_valid_input(buffer)) {
-        printf("[reverse_proxy-%d] Received invalid input, returning -1\n", proxy_id);
+    // Check if we received at least the header
+    if (bytes_read < HEADER_SIZE) {
+        printf("[reverse_proxy-%d] Received incomplete message (less than header size)\n", proxy_id);
         const char* error_msg = "-1";
         write(client_socket, error_msg, strlen(error_msg));
         close(client_socket);
         return;
     }
     
-    printf("[reverse_proxy-%d] Received valid input, forwarding to server ID %d\n", 
-           proxy_id, server->id);
+    // Extract the client ID from the 32-byte header
+    char header[HEADER_SIZE + 1] = {0};
+    memcpy(header, buffer, HEADER_SIZE);
+    int client_id = atoi(header);
+    
+    // Extract the actual input data that follows the header
+    char* input_data = buffer + HEADER_SIZE;
+    size_t input_length = bytes_read - HEADER_SIZE;
+    
+    // Ensure null termination of input data for validation
+    input_data[input_length] = '\0';
+    
+    // Validate input - check if it's a non-negative float
+    if (!is_valid_input(input_data)) {
+        printf("[reverse_proxy-%d] Received invalid input from client %d, returning -1\n", 
+               proxy_id, client_id);
+        const char* error_msg = "-1";
+        write(client_socket, error_msg, strlen(error_msg));
+        close(client_socket);
+        return;
+    }
+    
+    printf("[reverse_proxy-%d] Received valid input from client %d, forwarding to server ID %d\n", 
+           proxy_id, client_id, server->id);
            
     // Create a socket to connect to the server
     int server_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -395,7 +415,7 @@ void handle_connection(int client_socket) {
         return;
     }
     
-    // Forward the validated input to the server
+    // Forward the entire message with header to the server
     if (send(server_socket, buffer, bytes_read, 0) != bytes_read) {
         close(server_socket);
         close(client_socket);

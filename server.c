@@ -13,6 +13,7 @@
 
 #define DEFAULT_PORT 9001
 #define RESPONSE_SIZE 1024
+#define HEADER_SIZE 32  // Size of the header in bytes
 
 // Global variables
 int server_fd;
@@ -94,25 +95,40 @@ void handle_connection(int client_socket) {
     char buffer[1024] = {0};
     int bytes_read;
     
-    // Read client request - expect a float value
+    // Read client request with 32-byte header
     bytes_read = read(client_socket, buffer, sizeof(buffer) - 1);
     if (bytes_read <= 0) {
-        printf("[server] Error reading from client or connection closed\n");
+        printf("[server-%d] Error reading from client or connection closed\n", server_id);
         close(client_socket);
         return;
     }
     
-    // Ensure null termination
-    buffer[bytes_read] = '\0';
+    // Check if we received enough data (at least the header)
+    if (bytes_read < HEADER_SIZE) {
+        printf("[server-%d] Received incomplete message (less than header size)\n", server_id);
+        close(client_socket);
+        return;
+    }
+    
+    // Extract the client ID from the 32-byte header
+    char header[HEADER_SIZE + 1] = {0};
+    memcpy(header, buffer, HEADER_SIZE);
+    int client_id = atoi(header);
+    
+    // Extract the actual input data that follows the header
+    char* input_data = buffer + HEADER_SIZE;
+    size_t input_length = bytes_read - HEADER_SIZE;
+    input_data[input_length] = '\0';  // Ensure null termination
     
     // Parse the float
-    double input_value = atof(buffer);
+    double input_value = atof(input_data);
     
     // Calculate square root and send response
     char response[RESPONSE_SIZE];
     double sqrt_result = sqrt(input_value);
     snprintf(response, RESPONSE_SIZE, "%.6f", sqrt_result);
-    printf("[server-%d] Processing request for input: %f, result: %s\n", server_id, input_value, response);
+    printf("[server-%d] Processing request from client %d for input: %f, result: %s\n", 
+           server_id, client_id, input_value, response);
     
     // Send response
     write(client_socket, response, strlen(response));

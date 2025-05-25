@@ -11,6 +11,7 @@
 #define DEFAULT_SERVER_IP "127.0.0.1"
 #define DEFAULT_SERVER_PORT 8080  // Default port for the load balancer
 #define BUFFER_SIZE 1024
+#define HEADER_SIZE 32  // Size of the header in bytes
 
 // Function to create a connection to the server
 int connect_to_server(const char* ip, int port) {
@@ -65,27 +66,28 @@ char* get_user_input() {
     return input_buffer;
 }
 
-// Function to send client ID and a number to the server
+// Function to send client ID and a number to the server with a 32-byte header
 void send_request(int socket_fd, int client_id, const char* input_value) {
-    char client_id_str[16];
-    snprintf(client_id_str, sizeof(client_id_str), "%d", client_id);
+    // Create the message with the 32-byte header and the input value
+    char message[BUFFER_SIZE];
+    memset(message, 0, BUFFER_SIZE);  // Clear the buffer
     
-    // Send client ID first to identify ourselves to the load balancer
-    if (send(socket_fd, client_id_str, strlen(client_id_str), 0) < 0) {
-        perror("[client] Failed to send client ID");
+    // Format the client ID into the 32-byte header (padded with spaces)
+    snprintf(message, HEADER_SIZE, "%-32d", client_id);
+    
+    // Add the input value after the header
+    strcat(message + HEADER_SIZE, input_value);
+    
+    // Get the total message length
+    size_t message_len = HEADER_SIZE + strlen(input_value);
+    
+    // Send the complete message
+    if (send(socket_fd, message, message_len, 0) < 0) {
+        perror("[client] Failed to send message with header");
         return;
     }
     
-    // Small delay to ensure client ID is processed separately
-    usleep(50000);  // 50ms delay
-    
-    // Send the input number to the server
-    if (send(socket_fd, input_value, strlen(input_value), 0) < 0) {
-        perror("[client] Failed to send input");
-        return;
-    }
-    
-    printf("Input: %s\n", input_value);
+    printf("Input: %s (Client ID: %d)\n", input_value, client_id);
 }
 
 // Function to receive response from the server

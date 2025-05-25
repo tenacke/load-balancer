@@ -16,6 +16,7 @@
 #define MAX_REVERSE_PROXIES 2
 #define DEFAULT_PORT 8080
 #define MAX_THREADS 100
+#define HEADER_SIZE 32  // Size of the header in bytes
 
 // Global variables
 int server_fd;
@@ -224,20 +225,27 @@ void* handle_connection_thread(void* arg) {
 
 // Handle a client connection and forward to a reverse proxy
 void handle_connection(int client_socket, struct sockaddr_in *client_addr) {
-    // First, try to determine client ID from the client metadata
-    // We'll use the last octet of the IP address as default
+    // Default client ID from IP address in case header reading fails
     int client_id = client_addr->sin_addr.s_addr & 0xFF;
     char client_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(client_addr->sin_addr), client_ip, INET_ADDRSTRLEN);
     
-    // Read first message from client which should be their ID
-    char id_buffer[32] = {0};
-    int bytes_read = recv(client_socket, id_buffer, sizeof(id_buffer) - 1, 0);
+    // Buffer to hold the complete message (header + data)
+    char buffer[1024] = {0};
+    int bytes_read = recv(client_socket, buffer, sizeof(buffer) - 1, 0);
     
-    if (bytes_read > 0) {
-        id_buffer[bytes_read] = '\0';
-        client_id = atoi(id_buffer);
+    if (bytes_read < HEADER_SIZE) {
+        printf("[load_balancer] Received incomplete message (less than header size)\n");
+        const char* error_msg = "-1";
+        write(client_socket, error_msg, strlen(error_msg));
+        close(client_socket);
+        return;
     }
+    
+    // Extract the client ID from the 32-byte header
+    char header[HEADER_SIZE + 1] = {0};
+    memcpy(header, buffer, HEADER_SIZE);
+    client_id = atoi(header);
     
     // Get appropriate reverse proxy based on client ID
     ReverseProxy* proxy = get_proxy_for_client(client_id);
@@ -283,8 +291,16 @@ void handle_connection(int client_socket, struct sockaddr_in *client_addr) {
         return;
     }
     
-    // Forward data between client and proxy in both directions
-    char buffer[1024];
+    // We already have the initial data from the client in 'buffer'
+    // Just forward it directly to the proxy (with the 32-byte header intact)
+    if (send(proxy_socket, buffer, bytes_read, 0) != bytes_read) {
+        perror("[load_balancer] Failed to forward initial data to proxy");
+        close(proxy_socket);
+        close(client_socket);
+        return;
+    }
+    
+    // Now set up for bidirectional data transfer for any subsequent data
     ssize_t bytes_transferred;
     fd_set read_fds;
     int max_fd = (client_socket > proxy_socket) ? client_socket : proxy_socket;

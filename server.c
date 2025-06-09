@@ -83,6 +83,8 @@ bool initialize_server(int port) {
             snprintf(port_str, sizeof(port_str), "%d", port);
             write(pipe_fd, port_str, strlen(port_str));
         }
+    } else {
+        printf("[server-%d] Warning: WATCHDOG_PIPE_FD not set, cannot report port\n", server_id);
     }
     
     return true;

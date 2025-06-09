@@ -18,8 +18,13 @@
 #define MAX_THREADS 100
 #define HEADER_SIZE 32  // Size of the header in bytes
 
+// Forward declarations
+void initialize_proxy_ports(void);
+void read_proxy_ports_from_pipe(void);
+
 // Global variables
 int server_fd;
+int config_pipe_fd = -1;  // Global pipe FD for reading configuration
 volatile sig_atomic_t running = 1;
 
 // Thread argument structure
@@ -45,9 +50,29 @@ int current_proxy = 0;     // Used for round-robin load balancing
 
 // Signal handler
 void handle_signal(int sig) {
-    if (sig == SIGTERM) {
+    if (sig == SIGTERM || sig == SIGINT) {
         printf("[load_balancer] Received termination signal, shutting down...\n");
         running = 0;
+    } else if (sig == SIGHUP) {
+        printf("[load_balancer] Received SIGHUP, reading proxy ports from pipe\n");
+        // Read proxy ports from the pipe instead of environment variables
+        read_proxy_ports_from_pipe();
+        
+        // Check if we have any available proxies after reading configuration
+        bool any_proxy_available = false;
+        for (int i = 0; i < MAX_REVERSE_PROXIES; i++) {
+            if (reverse_proxies[i].available) {
+                any_proxy_available = true;
+                printf("[load_balancer] Proxy %d is available at port %d\n", i+1, reverse_proxies[i].port);
+                break;
+            }
+        }
+        
+        if (any_proxy_available) {
+            printf("[load_balancer] Updated proxy configuration received, now operational\n");
+        } else {
+            printf("[load_balancer] Warning: Received SIGHUP but no valid proxy configuration\n");
+        }
     }
 }
 
@@ -89,20 +114,147 @@ bool initialize_server(int port) {
 }
 
 // Initialize reverse proxy ports from environment variables
-void initialize_proxy_ports() {
-    char env_var[32];
-    char *env_val;
+// Read proxy port information from the config pipe
+void read_proxy_ports_from_pipe() {
+    if (config_pipe_fd < 0) {
+        printf("[load_balancer] Error: Cannot read from pipe - invalid file descriptor\n");
+        return;
+    }
     
-    for (int i = 0; i < MAX_REVERSE_PROXIES; i++) {
-        // Check for environment variables like REVERSE_PROXY_PORT_1, REVERSE_PROXY_PORT_2, etc.
-        snprintf(env_var, sizeof(env_var), "REVERSE_PROXY_PORT_%d", i + 1);
-        env_val = getenv(env_var);
+    char buffer[128];
+    memset(buffer, 0, sizeof(buffer));
+    
+    // Set non-blocking read with timeout to avoid hanging if pipe is empty
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(config_pipe_fd, &read_fds);
+    
+    struct timeval timeout;
+    timeout.tv_sec = 2;  // 2 second timeout - increased for reliability
+    timeout.tv_usec = 0;
+    
+    // Try multiple times in case data is not immediately available (common for respawned processes)
+    int max_attempts = 3;
+    int attempts = 0;
+    int ready = 0;
+    
+    while (attempts < max_attempts) {
+        ready = select(config_pipe_fd + 1, &read_fds, NULL, NULL, &timeout);
         
-        if (env_val != NULL) {
-            int port = atoi(env_val);
-            if (port > 0 && port < 65536) {
-                reverse_proxies[i].port = port;
-                reverse_proxies[i].available = true;
+        if (ready > 0) {
+            // Data available
+            break;
+        } else if (ready < 0) {
+            if (errno == EINTR) {
+                // Interrupted, try again
+                printf("[load_balancer] Select was interrupted, retrying...\n");
+                attempts++;
+                continue;
+            } else {
+                perror("[load_balancer] Error reading from config pipe");
+                return;
+            }
+        } else {
+            // Timeout
+            printf("[load_balancer] Attempt %d: No data available yet on pipe\n", attempts + 1);
+            attempts++;
+            
+            if (attempts < max_attempts) {
+                // Reset for next try
+                FD_ZERO(&read_fds);
+                FD_SET(config_pipe_fd, &read_fds);
+                timeout.tv_sec = 2;
+                timeout.tv_usec = 0;
+            }
+        }
+    }
+    
+    if (ready <= 0) {
+        printf("[load_balancer] No data received after %d attempts\n", max_attempts);
+        return;
+    }
+    
+    // Data is available, read it
+    ssize_t bytes_read = read(config_pipe_fd, buffer, sizeof(buffer) - 1);
+    
+    if (bytes_read <= 0) {
+        // Error or end of file
+        if (bytes_read < 0) {
+            perror("[load_balancer] Failed to read from config pipe");
+        } else {
+            printf("[load_balancer] Config pipe closed or empty\n");
+        }
+        return;
+    }
+    
+    buffer[bytes_read] = '\0';  // Ensure null-termination
+    
+    // Parse the proxy port information
+    // Format expected: "count:port1:port2:...:portn:"
+    char *token;
+    char *rest = buffer;
+    
+    // Get proxy count
+    token = strtok_r(rest, ":", &rest);
+    if (!token) {
+        printf("[load_balancer] Error: Invalid proxy port data format\n");
+        return;
+    }
+    
+    int proxy_count = atoi(token);
+    
+    if (proxy_count <= 0 || proxy_count > MAX_REVERSE_PROXIES) {
+        printf("[load_balancer] Error: Invalid proxy count: %d\n", proxy_count);
+        return;
+    }
+    
+    // Read each proxy port
+    for (int i = 0; i < proxy_count && i < MAX_REVERSE_PROXIES; i++) {
+        // Get the port for this proxy
+        token = strtok_r(rest, ":", &rest);
+        if (!token) {
+            printf("[load_balancer] Warning: Not enough ports in data for proxy %d\n", i + 1);
+            continue;
+        }
+        
+        int port = atoi(token);
+        
+        if (port > 0 && port < 65536) {
+            reverse_proxies[i].port = port;
+            reverse_proxies[i].available = true;
+        } else {
+            reverse_proxies[i].available = false;
+        }
+    }
+}
+
+void initialize_proxy_ports() {
+    // Start in non-workable state
+    for (int i = 0; i < MAX_REVERSE_PROXIES; i++) {
+        reverse_proxies[i].available = false;
+    }
+    
+    // Check if config pipe is available
+    if (config_pipe_fd >= 0) {
+        read_proxy_ports_from_pipe();
+    } else {
+        printf("[load_balancer] Warning: Config pipe not available, cannot receive configuration\n");
+        
+        // Only as a fallback if pipe isn't available (should not happen in normal operation)
+        char env_var[32];
+        char *env_val;
+        
+        for (int i = 0; i < MAX_REVERSE_PROXIES; i++) {
+            // Check for environment variables like REVERSE_PROXY_PORT_1, REVERSE_PROXY_PORT_2, etc.
+            snprintf(env_var, sizeof(env_var), "REVERSE_PROXY_PORT_%d", i + 1);
+            env_val = getenv(env_var);
+            
+            if (env_val != NULL) {
+                int port = atoi(env_val);
+                if (port > 0 && port < 65536) {
+                    reverse_proxies[i].port = port;
+                    reverse_proxies[i].available = true;
+                }
             }
         }
     }
@@ -116,12 +268,8 @@ void initialize_proxy_ports() {
         }
     }
     
-    // If no proxies are available, set default values for testing
-    if (!any_proxy_available) {
-        reverse_proxies[0].port = 8081;
-        reverse_proxies[0].available = true;
-        reverse_proxies[1].port = 8082;
-        reverse_proxies[1].available = true;
+    if (any_proxy_available) {
+        printf("[load_balancer] Proxy ports configured, load balancer now operational\n");
     }
 }
 
@@ -374,19 +522,42 @@ int main(int argc, char *argv[]) {
         }
     }
     
+    // Get the config pipe file descriptor from environment
+    char *config_pipe_str = getenv("WATCHDOG_CONFIG_PIPE_FD");
+    if (config_pipe_str != NULL) {
+        config_pipe_fd = atoi(config_pipe_str);
+        if (config_pipe_fd <= 0) {
+            printf("[load_balancer] Warning: Invalid config pipe FD: %s\n", config_pipe_str);
+            config_pipe_fd = -1;
+        }
+    } else {
+        printf("[load_balancer] Warning: WATCHDOG_CONFIG_PIPE_FD not set\n");
+        config_pipe_fd = -1;
+    }
+    
     // Set up signal handlers
     signal(SIGTERM, handle_signal);
     signal(SIGINT, handle_signal);
+    signal(SIGHUP, handle_signal);
     
     printf("[load_balancer] Starting load balancer\n");
     
-    // Initialize reverse proxy ports from environment variables
-    initialize_proxy_ports();
+    // Start in non-workable state, will be made operational after receiving configuration
+    for (int i = 0; i < MAX_REVERSE_PROXIES; i++) {
+        reverse_proxies[i].available = false;
+    }
     
-    // Initialize server
+    // Initialize server first
     if (!initialize_server(port)) {
+        if (config_pipe_fd >= 0) {
+            close(config_pipe_fd);
+        }
         return EXIT_FAILURE;
     }
+
+    
+    // Initialize reverse proxy ports from config pipe
+    initialize_proxy_ports();
     
     // Main loop
     while (running) {
@@ -425,5 +596,11 @@ int main(int argc, char *argv[]) {
     
     // Clean up and exit
     cleanup();
+    
+    // Close config pipe if it's open
+    if (config_pipe_fd >= 0) {
+        close(config_pipe_fd);
+    }
+    
     return EXIT_SUCCESS;
 }
